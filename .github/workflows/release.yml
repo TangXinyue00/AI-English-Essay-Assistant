@@ -1,0 +1,394 @@
+name: Release Astron Agent
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'      # 匹配语义版本号 (v1.0.0, v2.1.3, etc.)
+      - 'v*.*.*-*'    # 匹配预发布版本 (v1.0.0-beta.1, v2.1.0-rc.1, etc.)
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g., v1.0.0)'
+        required: true
+        type: string
+      prerelease:
+        description: 'Mark as pre-release'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: write
+  attestations: write
+  id-token: write
+
+env:
+  REGISTRY_GHCR: ghcr.io
+
+jobs:
+  # ============================================================================
+  # Stage 1: Validation and Preparation
+  # ============================================================================
+  prepare-release:
+    name: 🚀 Prepare Release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      is-prerelease: ${{ steps.meta.outputs.is-prerelease }}
+      has-core-services: ${{ steps.detect.outputs.has-core-services }}
+      has-console-hub: ${{ steps.detect.outputs.has-console-hub }}
+      has-console-frontend: ${{ steps.detect.outputs.has-console-frontend }}
+      changelog: ${{ steps.changelog.outputs.changelog }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch complete history for changelog generation
+
+      - name: Validate tag format
+        id: meta
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VERSION="${{ github.event.inputs.tag }}"
+            IS_PRERELEASE="${{ github.event.inputs.prerelease }}"
+          else
+            VERSION=${GITHUB_REF#refs/tags/}
+            # Check if it's a pre-release version (contains -, alpha, beta, rc, etc.)
+            if [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              IS_PRERELEASE="false"
+            else
+              IS_PRERELEASE="true"
+            fi
+          fi
+
+          # Validate version format
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "❌ Invalid version format: $VERSION"
+            echo "✅ Correct format: v1.0.0, v1.0.0-beta.1, v1.0.0-rc.1"
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "is-prerelease=$IS_PRERELEASE" >> $GITHUB_OUTPUT
+
+          echo "🏷️ Release version: $VERSION"
+          echo "🔖 Pre-release: $IS_PRERELEASE"
+
+      - name: Smart project detection
+        id: detect
+        run: |
+          echo "🔍 Detecting Astron Agent components..."
+
+          HAS_CORE_SERVICES="false"
+          HAS_CONSOLE_HUB="false"
+          HAS_CONSOLE_FRONTEND="false"
+
+          # Detect Core service components (based on build-push.yml structure)
+          CORE_COMPONENTS=("tenant" "memory/database" "plugin/rpa" "plugin/link" "plugin/aitools" "agent" "knowledge" "workflow")
+          CORE_COUNT=0
+
+          for component in "${CORE_COMPONENTS[@]}"; do
+            if [[ -f "core/${component}/Dockerfile" ]]; then
+              CORE_COUNT=$((CORE_COUNT + 1))
+              echo "✅ Core component: core/${component}/"
+            fi
+          done
+
+          if [[ $CORE_COUNT -gt 0 ]]; then
+            HAS_CORE_SERVICES="true"
+            echo "✅ Detected $CORE_COUNT Core service components"
+          fi
+
+          # Detect Console Hub (Java)
+          if [[ -f "console/backend/hub/pom.xml" && -f "console/backend/hub/Dockerfile" ]]; then
+            HAS_CONSOLE_HUB="true"
+            echo "✅ Console Hub: console/backend/hub/ (Java Spring Boot)"
+          fi
+
+          # Detect Console Frontend (React)
+          if [[ -f "console/frontend/package.json" && -f "console/frontend/Dockerfile" ]]; then
+            HAS_CONSOLE_FRONTEND="true"
+            echo "✅ Console Frontend: console/frontend/ (React)"
+          fi
+
+          echo "has-core-services=$HAS_CORE_SERVICES" >> $GITHUB_OUTPUT
+          echo "has-console-hub=$HAS_CONSOLE_HUB" >> $GITHUB_OUTPUT
+          echo "has-console-frontend=$HAS_CONSOLE_FRONTEND" >> $GITHUB_OUTPUT
+
+      - name: Generate Changelog
+        id: changelog
+        run: |
+          echo "📝 Generating changelog..."
+
+          # Get previous tag
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          CURRENT_TAG="${{ steps.meta.outputs.version }}"
+
+          if [[ -z "$PREVIOUS_TAG" ]]; then
+            echo "🆕 This is the first release"
+            COMMIT_RANGE="HEAD"
+          else
+            echo "📊 Comparing: $PREVIOUS_TAG...$CURRENT_TAG"
+            COMMIT_RANGE="$PREVIOUS_TAG..HEAD"
+          fi
+
+          # Create changelog
+          CHANGELOG_FILE="/tmp/changelog.md"
+
+          # Write header
+          echo "## What's Changed" > "$CHANGELOG_FILE"
+          echo "" >> "$CHANGELOG_FILE"
+
+          # Collect and categorize commits
+          echo "### ✨ New Features" >> "$CHANGELOG_FILE"
+          FEATURES=$(git log --pretty=format:"%s" $COMMIT_RANGE | grep "^feat" | sed 's/^feat[^:]*: /- /')
+          if [[ -n "$FEATURES" ]]; then
+            echo "$FEATURES" >> "$CHANGELOG_FILE"
+          else
+            echo "- No new features in this release" >> "$CHANGELOG_FILE"
+          fi
+
+          echo "" >> "$CHANGELOG_FILE"
+          echo "### 🐛 Fixes" >> "$CHANGELOG_FILE"
+          FIXES=$(git log --pretty=format:"%s" $COMMIT_RANGE | grep "^fix" | sed 's/^fix[^:]*: /- /')
+          if [[ -n "$FIXES" ]]; then
+            echo "$FIXES" >> "$CHANGELOG_FILE"
+          else
+            echo "- No bug fixes in this release" >> "$CHANGELOG_FILE"
+          fi
+
+          echo "" >> "$CHANGELOG_FILE"
+          echo "### 🔧 Improvements" >> "$CHANGELOG_FILE"
+          IMPROVEMENTS=$(git log --pretty=format:"%s" $COMMIT_RANGE | grep -E "^(chore|docs|refactor|test|ci|perf|style)" | sed 's/^[^:]*: /- /')
+          if [[ -n "$IMPROVEMENTS" ]]; then
+            echo "$IMPROVEMENTS" >> "$CHANGELOG_FILE"
+          else
+            echo "- No improvements in this release" >> "$CHANGELOG_FILE"
+          fi
+
+          # Output to GitHub Output
+          {
+            echo "changelog<<EOF"
+            cat "$CHANGELOG_FILE"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
+          echo "📄 Changelog generated successfully"
+
+  # ============================================================================
+  # Stage 2: Build Docker Images (reuse build-push logic)
+  # ============================================================================
+  build-core-services:
+    name: 🏗️ Build Core Services
+    runs-on: ubuntu-latest
+    needs: prepare-release
+    if: needs.prepare-release.outputs.has-core-services == 'true'
+    strategy:
+      matrix:
+        service:
+          - { name: "tenant", path: "core/tenant", emoji: "🏢" }
+          - { name: "database", path: "core/memory/database", emoji: "🧠" }
+          - { name: "rpa", path: "core/plugin/rpa", emoji: "🤖" }
+          - { name: "link", path: "core/plugin/link", emoji: "🔗" }
+          - { name: "aitools", path: "core/plugin/aitools", emoji: "🛠️" }
+          - { name: "agent", path: "core/agent", emoji: "🤖" }
+          - { name: "knowledge", path: "core/knowledge", emoji: "📚" }
+          - { name: "workflow", path: "core/workflow", emoji: "⚡" }
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY_GHCR }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.REGISTRY_GHCR }}/${{ github.repository }}/core-${{ matrix.service.name }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=${{ needs.prepare-release.outputs.version }}
+
+      - name: Build and push ${{ matrix.service.emoji }} ${{ matrix.service.name }} image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./${{ matrix.service.path }}/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ needs.prepare-release.outputs.version }}
+            GIT_COMMIT=${{ github.sha }}
+            BUILD_TIME=${{ github.run_id }}
+          no-cache: true
+
+  build-console-hub:
+    name: ☕ Build Console Hub
+    runs-on: ubuntu-latest
+    needs: prepare-release
+    if: needs.prepare-release.outputs.has-console-hub == 'true'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY_GHCR }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.REGISTRY_GHCR }}/${{ github.repository }}/console-hub
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=${{ needs.prepare-release.outputs.version }}
+
+      - name: Build and push Console Hub image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./console/backend/hub/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ needs.prepare-release.outputs.version }}
+            GIT_COMMIT=${{ github.sha }}
+            BUILD_TIME=${{ github.run_id }}
+          no-cache: true
+          provenance: false
+          sbom: false
+
+  build-console-frontend:
+    name: 🌐 Build Console Frontend
+    runs-on: ubuntu-latest
+    needs: prepare-release
+    if: needs.prepare-release.outputs.has-console-frontend == 'true'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          install: true
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY_GHCR }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.REGISTRY_GHCR }}/${{ github.repository }}/console-frontend
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=${{ needs.prepare-release.outputs.version }}
+
+      - name: Build and push Console Frontend image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./console/frontend/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ needs.prepare-release.outputs.version }}
+            GIT_COMMIT=${{ github.sha }}
+            BUILD_TIME=${{ github.run_id }}
+          no-cache: true
+
+  # ============================================================================
+  # Stage 3: Create GitHub Release
+  # ============================================================================
+  create-release:
+    name: 🎉 Create GitHub Release
+    runs-on: ubuntu-latest
+    needs:
+      - prepare-release
+      - build-core-services
+      - build-console-hub
+      - build-console-frontend
+    if: always() && needs.prepare-release.result == 'success'
+    steps:
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ needs.prepare-release.outputs.version }}
+          name: "Astron Agent ${{ needs.prepare-release.outputs.version }}"
+          body: ${{ needs.prepare-release.outputs.changelog }}
+          prerelease: ${{ needs.prepare-release.outputs.is-prerelease }}
+          generate_release_notes: true
+          append_body: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Release Summary
+        run: |
+          echo "=== 🎉 Astron Agent Release Summary ==="
+          echo ""
+          echo "🏷️ Version: ${{ needs.prepare-release.outputs.version }}"
+          echo "🔖 Pre-release: ${{ needs.prepare-release.outputs.is-prerelease }}"
+          echo "📦 Release page: https://github.com/${{ github.repository }}/releases/tag/${{ needs.prepare-release.outputs.version }}"
+          echo ""
+
+          echo "🐳 Docker Image Build Status:"
+          echo "  🏗️ Core Services: ${{ needs.build-core-services.result }}"
+          echo "  ☕ Console Hub: ${{ needs.build-console-hub.result }}"
+          echo "  🌐 Console Frontend: ${{ needs.build-console-frontend.result }}"
+          echo ""
+
+          echo "🎯 Quick Start:"
+          echo "git clone https://github.com/${{ github.repository }}.git"
+          echo "cd astron-agent"
+          echo "git checkout ${{ needs.prepare-release.outputs.version }}"
+          echo "docker-compose up -d"
+          echo ""
+
+          echo "✅ 🚀 Astron Agent Release Complete!"
