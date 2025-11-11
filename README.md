@@ -67,7 +67,7 @@ docker compose -f docker-compose-with-auth.yaml up -d
 ## 使用指南
 
 1. 登录系统后，点击「创建」选择「工作流」
-2. 导入AI-English-Essay-Assistant工作流
+2. 导入AI-English-Essay-Assistant工作流，文件位置：docker/astronAgent/AI-English-Essay-Assistant.yml
 3. 保存并运行工作流
 4. 上传作文获得结果
 
